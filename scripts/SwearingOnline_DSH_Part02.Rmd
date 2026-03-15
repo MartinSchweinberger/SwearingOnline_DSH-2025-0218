@@ -1,0 +1,761 @@
+---
+title: "Swearing online: Exploring dimensions of variability in born-digital data - Part 2: Data Processing and Usage Statistics"
+author: "Martin Schweinberger"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Introduction
+
+This notebook documents the second stage of the analysis of swear words in the Australian (AU), British (GB), and American (US) Twitterspheres. Building on the cleaned KWIC data produced in Part 1, it covers:
+
+1. Overview of vulgar lemma frequencies across the full corpus
+2. Relative frequency visualisation by country (per million words)
+3. Configuration Frequency Analysis (CFA) of regional swearing preferences
+4. Collostructional/keyness analysis of pairwise regional contrasts
+5. Combined visualisation of cross-regional keyness (Figure 5)
+
+---
+
+# Preparation
+
+## Install packages
+
+Set `eval = TRUE` on first use; revert to `eval = FALSE` once packages are installed.
+
+```{r inst, eval = FALSE}
+install.packages(c(
+  "dplyr",       # data manipulation
+  "here",        # reproducible file paths
+  "stringr",     # string operations
+  "quanteda",    # corpus tools
+  "tidytext",    # tidy text utilities (incl. reorder_within)
+  "sentimentr",  # sentiment analysis (used in later notebooks)
+  "writexl",     # Excel export
+  "ggplot2",     # visualisation
+  "Hmisc",       # miscellaneous stats utilities
+  "cfa",         # Configuration Frequency Analysis
+  "countrycode", # country code conversion
+  "ggimage",     # image-based ggplot2 extensions
+  "forcats",     # factor reordering helpers
+  "devtools"     # install from GitHub
+))
+devtools::install_github("rensa/ggflags")  # flag emoji geoms for ggplot2
+```
+
+## Activate packages
+
+```{r activate, message = FALSE, warning = FALSE}
+library(dplyr)
+library(here)
+library(stringr)
+library(tidytext)
+library(quanteda)
+library(sentimentr)
+library(writexl)
+library(ggplot2)
+library(Hmisc)
+library(cfa)
+library(countrycode)
+library(ggflags)
+library(forcats)
+```
+
+---
+
+# Load Data
+
+Load the full tweet dataset (for word counts) and the cleaned KWIC results (for swear word instances) produced in Part 1.
+
+```{r load}
+twdat  <- readRDS(file = here("data", "twdat.rda"))
+kwicdf <- readRDS(file = here("tables", "kwicdf_clean.rda"))
+
+str(twdat)
+str(kwicdf)
+```
+
+---
+
+# Vulgar Language Overview
+
+## Figure 1: Raw frequency of each vulgar lemma (all countries combined)
+
+This plot shows how often each lemma appears across the entire corpus, with percentage labels to indicate each lemma's share of total vulgarity instances.
+
+```{r fig1-lemma-freq}
+kwicdf |>
+  group_by(lemma) |>
+  summarise(freq = n()) |>
+  ungroup() |>
+  mutate(
+    total   = sum(freq),
+    percent = round(freq / total * 100, 2)
+  ) |>
+  ggplot(aes(reorder(lemma, freq), freq)) +
+  geom_bar(stat = "identity", fill = "gray30") +
+  geom_text(
+    aes(y = freq + 7000,
+        label = paste0(freq, " (", percent, "%)")),
+    size = 2.5, col = "gray20"
+  ) +
+  theme_bw() +
+  labs(x = "", y = "Absolute frequency") +
+  coord_flip(ylim = c(0, 55000)) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave(here("images", "Fig1.png"), width = 15, height = 20, units = "cm", dpi = 600)
+```
+
+## Top lemmas by share of total vulgarity
+
+Ranks lemmas by percentage share; useful for reporting the most frequent terms in the paper.
+
+```{r top-lemmas}
+kwicdf |>
+  group_by(lemma) |>
+  summarise(freq = n()) |>
+  ungroup() |>
+  mutate(
+    total   = sum(freq),
+    percent = round(freq / total * 100, 2)
+  ) |>
+  arrange(-percent) -> topvul
+
+# Report cumulative share of the top 6 lemmas
+sum(head(topvul$percent))
+```
+
+---
+
+# Relative Frequency by Country
+
+## Identify high-frequency lemmas (N > 500 in any region)
+
+Lemmas occurring fewer than 500 times in any single region are grouped into an "other" category to keep plots readable.
+
+```{r high-freq-lemmas}
+# Identify lemmas that exceed the frequency threshold in at least one region
+lemmaredux <- kwicdf |>
+  group_by(code, lemma) |>
+  summarise(freq = n(), .groups = "drop") |>
+  mutate(total = sum(freq)) |>
+  mutate(lemma_recoded = ifelse(freq > 500, lemma, "other")) |>
+  filter(lemma_recoded != "other") |>
+  pull(lemma) |>
+  unique()
+
+lemmaredux
+```
+
+## Compute per-million-word rates
+
+Normalise swear word counts by total words per region to allow fair cross-regional comparison.
+
+```{r pmw-rates}
+# Total word count per country (denominator for normalisation)
+twdatsum <- twdat |>
+  group_by(code) |>
+  summarise(words = sum(words))
+
+# Aggregate KWIC counts per country × lemma; collapse rare lemmas into "other"
+kwicsum <- kwicdf |>
+  mutate(lemma = ifelse(lemma %in% lemmaredux, lemma, "other")) |>
+  group_by(code, lemma) |>
+  summarise(freq = n(), .groups = "drop")
+
+# Join word counts and compute per-million-word rate
+Fig2dat <- left_join(twdatsum, kwicsum, by = "code") |>
+  mutate(pmw = round(freq / words * 1000000, 3))
+
+Fig2dat
+```
+
+
+
+## Figure 2: Per-million-word rates with dodged country flags (final publication version)
+
+```{r fig2b}
+Fig2dat |>
+  ggplot(aes(x = reorder(lemma, pmw), y = pmw, group = code, country = code)) +
+  geom_flag(position = position_dodge(width = 0.3)) +
+  coord_flip() +
+  theme_bw() +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor    = element_blank()
+  ) +
+  labs(
+    y = "Relative Frequency (per million words)",
+    x = "Vulgar lemma (only N > 500)"
+  )
+
+ggsave(here("figures", "Figure 2.png"),
+       width = 15, height = 18, units = "cm", dpi = 600)
+```
+
+# Topic Modeling
+
+## Install packages
+
+Set `eval = TRUE` on first use; revert to `eval = FALSE` once packages are installed.
+
+```{r inst, eval = FALSE}
+install.packages(c(
+  "dplyr",        # data manipulation
+  "here",         # reproducible file paths
+  "stringr",      # string operations
+  "quanteda",     # corpus and tokenisation tools
+  "tidytext",     # tidy text utilities
+  "sentimentr",   # sentiment analysis
+  "writexl",      # Excel export
+  "ggplot2",      # visualisation
+  "Hmisc",        # miscellaneous stats utilities
+  "cfa",          # Configuration Frequency Analysis
+  "forcats",      # factor reordering helpers
+  "report",       # automated model reporting
+  "reshape2",     # data reshaping
+  "rms",          # regression modelling strategies
+  "lme4",         # mixed-effects models
+  "sjPlot",       # model visualisation
+  "car",          # companion to applied regression
+  "Boruta",       # feature selection via random forests
+  "topicmodels",  # LDA topic modelling
+  "seededlda",    # seeded/semi-supervised LDA
+  "countrycode",  # country code conversion
+  "ggimage",      # image-based ggplot2 extensions
+  "devtools"      # install from GitHub
+))
+devtools::install_github("rensa/ggflags")  # flag emoji geoms for ggplot2
+```
+
+## Activate packages
+
+```{r activate, message = FALSE, warning = FALSE}
+library(dplyr)
+library(here)
+library(stringr)
+library(tidytext)
+library(quanteda)
+library(sentimentr)
+library(writexl)
+library(ggplot2)
+library(Hmisc)
+library(cfa)
+library(topicmodels)
+library(countrycode)
+library(seededlda)
+library(reshape2)
+library(ggflags)
+library(report)
+library(Boruta)
+library(rms)
+library(lme4)
+library(sjPlot)
+library(car)
+library(forcats)
+```
+
+---
+
+# Load Data
+
+Load the full tweet dataset and the cleaned KWIC swear-word instances produced in Part 1.
+
+```{r load}
+twdat  <- readRDS(file = here("data", "twdat.rda"))
+kwicdf <- readRDS(file = here("tables", "kwicdf_clean.rda"))
+
+str(twdat)
+str(kwicdf)
+```
+
+---
+
+# Corpus Summary Statistics
+
+## Aggregate vulgarity counts per tweet
+
+Count how many vulgar tokens appear in each tweet (identified by `docname` within each region).
+
+```{r vuln-per-tweet}
+kwicdat <- kwicdf |>
+  group_by(code, docname) |>
+  summarise(vulgar = n(), .groups = "drop")
+
+head(kwicdat)
+```
+
+## Join vulgarity counts back to the tweet-level data
+
+Tweets with no matches receive `vulgar = 0` via `replace_na`.
+
+```{r join-vulgar}
+dat <- left_join(twdat, kwicdat, by = c("docname", "code"))
+head(dat)
+table(dat$code)
+```
+
+## Table 1: Corpus overview by region
+
+Summarises token count, tweet count, unique users, and vulgarity rates (at tweet and token level) for each region.
+
+```{r table1}
+Table1 <- dat |>
+  tidyr::replace_na(list(vulgar = 0)) |>
+  group_by(code) |>
+  summarise(
+    Tokens                = sum(words),
+    Tweets                = n(),
+    Users                 = n_distinct(user_id),
+    VulgarTokens          = sum(vulgar),
+    VulgarTweets          = sum(vulgar > 0),
+    MeanLengthTweet       = round(Tokens / Tweets, 1),
+    PercentVulgarTweets   = round(VulgarTweets / Tweets * 100, 2),
+    PercentVulgarTokens   = round(VulgarTokens / Tokens * 100, 2)
+  )
+
+Table1
+
+# Overall totals
+summarise(Table1,
+  TotalTokens = sum(Tokens),
+  TotalTweets = sum(Tweets),
+  TotalUsers  = sum(Users),
+  MeanTweetLength = sum(Tokens) / sum(Tweets)
+)
+```
+
+## Table 1b: Users who produced at least one vulgar tweet
+
+Reports the proportion of users in each region who swore at least once.
+
+```{r table1b}
+Table1b <- dat |>
+  tidyr::replace_na(list(vulgar = 0)) |>
+  group_by(code, user_id) |>
+  summarise(used_vulgarity = any(vulgar > 0), .groups = "drop") |>
+  group_by(code) |>
+  summarise(
+    users       = n(),
+    vulgarusers = sum(used_vulgarity),
+    percent     = round(vulgarusers / users * 100, 1)
+  )
+
+Table1b
+```
+
+---
+
+# Data Preparation for Modelling
+
+Select and recode variables needed for downstream analysis. Key steps:
+
+- Remove columns not needed for modelling
+- Extract account creation year from `user_created_at`
+- Recode retweet/quote flags as binary strings
+- Log-transform right-skewed count variables (followers, likes, etc.) to reduce heteroscedasticity
+- Exclude very short tweets (< 5 tokens) as these are unlikely to provide useful topical context
+
+```{r data-prep}
+sdat <- dat |>
+  ungroup() |>
+  mutate(wordsonly = tolower(wordsonly)) |>
+  # Remove columns not needed for modelling
+  select(-tweet_retrieved_at, -conversation_id, -lang, -source,
+         -possibly_sensitive, -reply_settings, -withheld_copyright,
+         -tweet_withheld_country_codes, -tweet_link, -user_retrieved_at,
+         -username, -name, -location, -user_withheld_country_codes,
+         -user_link, -cleantext, -transformed_text, -country, -text,
+         -replied_to_tweet_id, -var) |>
+  mutate(
+    # Retain only account creation year
+    user_created_at    = str_remove(user_created_at, "-.*"),
+    # Recode retweet/quote IDs to readable labels
+    retweeted_tweet_id = ifelse(is.na(retweeted_tweet_id), "original", "retweet"),
+    quoted_tweet_id    = ifelse(is.na(quoted_tweet_id), "containsquote", "noquote"),
+    # Row ID for joining topic model output later
+    id = row_number()
+  ) |>
+  tidyr::replace_na(list(vulgar = 0)) |>
+  rename(
+    retweet  = retweeted_tweet_id,
+    quoted   = quoted_tweet_id,
+    tweets   = tweet_count,
+    listed   = listed_count,
+    usersince = user_created_at
+  ) |>
+  # Exclude very short tweets unlikely to carry topical signal
+  filter(words >= 5)
+
+head(sdat)
+nrow(sdat)
+```
+
+---
+
+# Topic Modelling
+
+Topic modelling assigns each tweet a thematic label, allowing us to test whether vulgarity rates vary by topic. We first run unsupervised LDA to explore the corpus, then use seeded (semi-supervised) LDA with a theory-informed dictionary to produce interpretable topics.
+
+## Step 1: Build document-feature matrix
+
+Tokenise, remove stop words and uninformative short tokens, stem, and convert to a document-feature matrix (DFM).
+
+```{r build-dfm, eval = T}
+ctxts <- sdat$wordsonly |>
+  tokens(
+    remove_punct   = TRUE,
+    remove_symbols = TRUE,
+    remove_numbers = TRUE,
+    remove_url     = TRUE
+  ) |>
+  # Remove English and Spanish stop words
+  tokens_select(pattern = stopwords("en"), selection = "remove") |>
+  tokens_select(pattern = stopwords("es"), selection = "remove") |>
+  # Remove tokens of 1–3 characters (except meaningful acronyms)
+  tokens_select(
+    pattern    = "\\b(?!i$|ai$|ml$|vr$|tv$|blm$|cat$|dog$|bus$|car$|sex$|nsfw$|law$|gdp$|dm$)[a-z]{1,3}\\b",
+    selection  = "remove",
+    valuetype  = "regex"
+  ) |>
+  tokens_wordstem() |>
+  dfm(tolower = TRUE)
+
+# Attach row IDs as document variables for later joining
+docvars(ctxts, "id") <- sdat$id
+
+# Remove empty documents (tweets with no remaining tokens after cleaning)
+ctxts <- dfm_subset(ctxts, ntoken(ctxts) > 0)
+
+ctxts[1:5, 1:5]
+```
+
+## Step 2: Unsupervised LDA
+
+Fit an unsupervised LDA model with k = 15 topics to explore the corpus thematically before specifying the seeded model. Change k to inspect topic stability.
+
+```{r unsupervised-lda, eval = FALSE}
+set.seed(1234)
+ddlda <- topicmodels::LDA(ctxts, k = 15, control = list(seed = 1234))
+saveRDS(ddlda, file = here("tables", "ddlda.rda"))
+```
+
+```{r load-unsupervised-lda, eval = FALSE}
+ddlda <- readRDS(file = here("tables", "ddlda.rda"))
+```
+
+### Inspect top terms per unsupervised topic
+
+```{r lda-top-terms, eval = FALSE}
+ntopics <- 15
+nterms  <- 10
+
+tidytext::tidy(ddlda, matrix = "beta") |>
+  group_by(topic) |>
+  slice_max(beta, n = nterms) |>
+  ungroup() |>
+  arrange(topic, -beta) |>
+  mutate(
+    term  = paste0(term, " (", round(beta, 3), ")"),
+    topic = factor(paste("topic", topic), levels = paste("topic", 1:ntopics)),
+    top   = factor(paste("top", rep(1:nterms, ntopics)), levels = paste("top", 1:nterms))
+  ) |>
+  select(-beta) |>
+  tidyr::spread(topic, term)
+```
+
+### Search for specific stems in the LDA vocabulary
+
+Useful for verifying that terms of interest (e.g. "bridge") appear in the topic model.
+
+```{r lda-vocab-search, eval = FALSE}
+tidytext::tidy(ddlda, matrix = "beta") |>
+  distinct(term) |>
+  filter(str_detect(term, "bridg"))
+```
+
+## Step 3: Seeded (semi-supervised) LDA
+
+Uses a theory-informed seed dictionary to guide topic assignment. Topics broadly reflect domains found in prior Twitter research (politics, sport, entertainment, etc.). The `residual = TRUE` argument adds a catch-all residual topic for tweets that do not fit any seed category well.
+
+```{r seeded-lda, eval = T}
+dict <- dictionary(list(
+  crime         = c("crime", "murder", "polic", "violenc", "theft", "assault", "shoot", "arrest", "prison", "gun"),
+  employment    = c("job", "employ", "work", "hire", "wage", "career", "unemploy", "salari", "intern", "boss"),
+  entertainment = c("music", "film", "movi", "show", "celebr", "tv", "netflix", "seri", "concert", "award"),
+  finance       = c("money", "bank", "stock", "invest", "crypt", "bitcoin", "market", "fund", "trade", "dollar"),
+  economy       = c("econom", "inflation", "recess", "gdp", "tax", "budget", "spend", "debt", "growth", "unemploy"),
+  fashion       = c("fashion", "style", "trend", "wear", "design", "outfit", "brand", "cloth", "runway", "makeup"),
+  food          = c("food", "eat", "cook", "drink", "restaur", "dinner", "snack", "meal", "beer", "wine"),
+  travel        = c("travel", "trip", "vacat", "flight", "hotel", "tourism", "holiday", "tour", "airport", "journey"),
+  gaming        = c("game", "gamer", "play", "console", "esport", "xbox", "playstat", "nintendo", "stream", "twitch"),
+  science       = c("scienc", "research", "experi", "lab", "discoveri", "theori", "univers", "evidenc", "space", "astronom"),
+  relationships = c("love", "relationship", "date", "friend", "partner", "romanc", "crush", "marriag", "coupl", "divorc"),
+  memes         = c("meme", "funni", "joke", "gif", "trend", "lol", "haha", "humor", "parodi", "troll"),
+  business      = c("busi", "market", "brand", "entrepreneur", "startup", "compani", "corpor", "manag", "profit", "industr"),
+  mental_health = c("stress", "anxieti", "depress", "mind", "therapi", "mental", "psycho", "wellb", "selfcar", "suicid"),
+  transport     = c("car", "traffic", "train", "bus", "bike", "road", "highway", "metro", "subway", "uber"),
+  shopping      = c("shop", "buy", "store", "sale", "discount", "amazon", "cart", "retail", "coupon", "order"),
+  activism      = c("right", "protest", "justic", "equal", "chang", "blm", "climat", "march", "activist", "campaign"),
+  pets          = c("pet", "dog", "cat", "anim", "vet", "puppi", "kitten", "hamster", "parrot", "adopt"),
+  tech          = c("tech", "comput", "ai", "internet", "digit", "data", "app", "cyber", "cloud", "softwar"),
+  ai_innovation = c("ai", "ml", "deeplearn", "chatgpt", "neural", "robot", "quantum", "blockchain", "crypto", "vr"),
+  medical       = c("medic", "health", "doctor", "hospit", "nurs", "sick", "diseas", "surgeri", "clinic", "treatment"),
+  immigration   = c("immigr", "migrat", "border", "visa", "asylum", "refuge", "citizenship", "deport", "migrant", "greencard"),
+  foreign       = c("foreign", "diplomat", "global", "intern", "trade", "allianc", "embassi", "sanction", "treati", "war"),
+  media         = c("media", "news", "journal", "press", "report", "articl", "editor", "headlin", "outlet", "tv"),
+  adult_content = c("porn", "sex", "nsfw", "xxx", "adult", "fetish", "nude", "erot", "onlyfan", "strip"),
+  politics      = c("politic", "elect", "vote", "democr", "republic", "senat", "congress", "parliament", "law", "polici"),
+  climate       = c("climat", "globalwarm", "sustain", "renew", "green", "pollut", "emiss", "ecolog", "solar", "carbon"),
+  sports        = c("sport", "team", "match", "game", "champion", "leagu", "soccer", "footbal", "basketbal", "tenni"),
+  education     = c("school", "univers", "student", "teacher", "class", "learn", "curriculum", "exam", "degree", "scholarship"),
+  social_media  = c("twitter", "tweet", "facebook", "insta", "tiktok", "hashtag", "post", "dm", "follow", "like"),
+  military      = c("militari", "war", "armi", "navy", "soldier", "defens", "weapon", "nuclear", "drone", "conflict"),
+  identity      = c("gender", "race", "lgbt", "queer", "trans", "ethnic", "inclus", "divers", "equal", "ident")
+))
+
+tmod_slda <- seededlda::textmodel_seededlda(
+  ctxts, dict,
+  residual     = TRUE,  # adds a catch-all residual topic
+  min_termfreq = 2
+)
+
+seededlda::terms(tmod_slda)  # inspect top terms per topic
+
+saveRDS(tmod_slda, file = here("tables", "tmod_slda.rda"))
+
+# Extract per-document topic assignments and save
+topic_df <- data.frame(
+  id    = tmod_slda$data@docvars$id,
+  Topic = seededlda::topics(tmod_slda)
+)
+
+saveRDS(topic_df, file = here("tables", "topic_df.rda"))
+head(topic_df)
+```
+
+## Load pre-computed topic assignments
+
+```{r load-topics}
+topic_df <- readRDS(file = here("tables", "topic_df.rda"))
+```
+
+## Join topic labels to tweet data
+
+Tweets that did not receive a topic (e.g. too short after cleaning) are labelled "no topic".
+
+```{r join-topics}
+rdat <- left_join(sdat, topic_df, by = "id") |>
+  mutate(
+    Topic = as.character(Topic),
+    Topic = replace(Topic, is.na(Topic), "no topic")
+  )
+
+# save
+saveRDS(rdat, here::here("tables", "rdat.rda"))
+
+nrow(sdat)
+nrow(rdat)  # should match: topic join is left join
+head(rdat)
+```
+
+## Topic overview table
+
+```{r topic-overview}
+rdat |>
+  group_by(Topic) |>
+  summarise(Frequency = n(), .groups = "drop") |>
+  mutate(Percentage = round(Frequency / sum(Frequency) * 100, 1)) |>
+  arrange(desc(Frequency))
+```
+
+---
+
+# Time-of-Day Analysis
+
+## Assign local time of day
+
+Twitter timestamps are stored in UTC. Offsets are applied to convert to local time for each region. Adjust these if the data span daylight saving periods.
+
+```{r local-time}
+# UTC offsets by region (standard time; adjust for DST if needed)
+offsets <- c(
+  us = -5,   # Eastern Standard Time (UTC−5)
+  gb = +1,   # British Summer Time (UTC+1)
+  au = +10   # Australian Eastern Standard Time (UTC+10)
+)
+
+rdat <- rdat |>
+  mutate(
+    code     = tolower(trimws(code)),
+    hour_utc = as.integer(str_extract(tweet_created_at, "(?<=T)\\d{2}")),
+    time     = factor((hour_utc + offsets[code]) %% 24)  # wrap midnight with modulo
+  ) |>
+  select(-hour_utc)
+
+table(rdat$code, rdat$time)
+```
+
+## Prepare modelling dataset
+
+Binary-recode vulgarity, log-transform count predictors, and factorise categorical variables. Log-transforming skewed counts (followers, likes, etc.) reduces leverage from extreme values in downstream regression models.
+
+```{r model-data}
+bdat <- rdat |>
+  select(-ltext) |>
+  mutate(
+    # Binary outcome: 1 = tweet contains at least one vulgar token
+    vulgar       = factor(ifelse(vulgar > 0, 1, 0)),
+
+    # Log-transform right-skewed count predictors (add small constant to handle zeros)
+    logtweets    = log(tweets + 0.01),
+    logfollowers = log(followers_count + 0.01),
+    logfollowing = log(following_count + 0.01),
+    loglisted    = log(listed + 0.01),
+    logretweets  = log(retweet_count + 0.01),
+    logreplies   = log(reply_count + 0.01),
+    loglikes     = log(like_count + 0.01),
+    logquotes    = log(quote_count + 0.01),
+
+    # Factorise categorical variables
+    topic = factor(Topic),
+    user  = factor(user_id)
+  ) |>
+  # Drop original (untransformed) count columns
+  select(-tweets, -followers_count, -following_count, -listed,
+         -retweet_count, -reply_count, -like_count, -user_id,
+         -quote_count, -tweet_id, -Topic, -tweet_created_at) |>
+  ungroup()
+
+head(bdat)
+```
+
+## Spot-checks: tweet volume by hour
+
+Quick sanity check that the local time conversion produces plausible distributions (peak activity during waking hours).
+
+```{r time-spot-check}
+# Helper: plot hourly tweet volume for a given region
+plot_hourly <- function(data, region) {
+  data |>
+    filter(code == region) |>
+    group_by(time) |>
+    summarise(freq = n(), .groups = "drop") |>
+    ggplot(aes(x = time, y = freq)) +
+    geom_bar(stat = "identity") +
+    labs(title = paste("Hourly tweet volume:", toupper(region)),
+         x = "Local hour", y = "Number of tweets") +
+    theme_bw()
+}
+
+# save data
+saveRDS(bdat, here::here("tables", "bdat,rda"))
+
+# plot
+plot_hourly(bdat, "au")
+plot_hourly(bdat, "gb")
+plot_hourly(bdat, "us")
+```
+
+## Helper function: compute phi-coefficients for discrete grouping variables
+
+This function computes the phi-coefficient for each level of a grouping variable (e.g. time of day, topic) within each region. Phi measures the strength of association between the grouping level and vulgarity, with sign indicating over- (+) or under- (-) representation relative to chance.
+
+```{r phi-helper}
+compute_phi <- function(data, group_var) {
+  data |>
+    group_by(code, {{ group_var }}) |>
+    summarise(
+      tweets = n(),
+      vulgar = sum(vulgar == "1"),
+      .groups = "drop"
+    ) |>
+    group_by(code) |>
+    mutate(
+      totaltweets = sum(tweets),
+      totalvulgar = sum(vulgar)
+    ) |>
+    ungroup() |>
+    mutate(
+      O11    = vulgar,
+      O12    = totalvulgar - O11,
+      O21    = tweets - O11,
+      O22    = totaltweets - O11 - O12 - O21,
+      R1     = totalvulgar,
+      C1     = tweets,
+      O11exp = C1 * R1 / totaltweets,
+      O11x2  = (O11 - O11exp)^2 / O11exp,
+      phi    = sqrt(O11x2 / totaltweets),
+      phi    = ifelse(O11 > O11exp, phi, -phi)
+    )
+}
+```
+
+## Figure 3: Vulgarity by time of day
+
+Phi-coefficients per hour-of-day, faceted by region. Red bars indicate hours when vulgarity is over-represented; blue bars indicate under-representation.
+
+```{r fig3-time-prep}
+Fig3dat <- compute_phi(bdat, time)
+head(Fig3dat)
+```
+
+
+Generate the publiacation-ready figure.
+
+```{r fig3-time}
+Fig3dat |>
+  mutate(code = dplyr::recode(code,
+    "us" = "United States",
+    "au" = "Australia",
+    "gb" = "United Kingdom"
+  )) |>
+  ggplot(aes(x = time, y = phi, fill = phi)) +
+  geom_bar(stat = "identity", color = "gray10") +
+  facet_wrap(~code, nrow = 3) +
+  theme_bw() +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  scale_x_discrete(
+    breaks = levels(Fig3dat$time),
+    labels = paste0(levels(Fig3dat$time), ":00")
+  ) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.x      = element_text(angle = 90),
+    legend.position  = "none"
+  ) +
+  labs(x = "Time of day (local time)", y = "Phi-coefficient")
+
+ggsave(here("figures", "Figure 3 - time.png"),
+       width = 15, height = 12, units = "cm", dpi = 600)
+```
+
+### Spot-check: what is tweeted in Australia at 6–7 pm?
+
+Inspects the content and topical distribution of Australian vulgar tweets in the early evening hours to understand the phi spike visible in Figure 3.
+
+```{r au-evening-check}
+# Sample of tweet text at 6–7 pm AU
+bdat |>
+  filter(code == "au", vulgar != "0", time %in% c("18", "19")) |>
+  select(wordsonly)
+
+# Topic distribution for the same time window
+bdat |>
+  filter(code == "au", vulgar != "0", time %in% c("18", "19")) |>
+  group_by(topic) |>
+  summarise(freq = n(), .groups = "drop") |>
+  arrange(-freq)
+```
+
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

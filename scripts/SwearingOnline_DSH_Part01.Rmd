@@ -1,0 +1,738 @@
+---
+title: "Swearing online: Exploring dimensions of variability in born-digital data - Part 1: Data Preparation, Extraction, and Processing"
+author: "Martin Schweinberger"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Introduction
+
+This notebook documents the first stage of the analysis of swear words in the Australian (AU), British (GB), and American (US) Twitterspheres. It covers:
+
+1. Loading and combining raw Twitter/X data from three regional datasets
+2. Cleaning and pre-processing tweet text
+3. Applying a regex-based vocabulary of vulgar expressions to extract swear word instances (KWIC)
+4. Annotating and cleaning the KWIC results for downstream analysis
+
+---
+
+# Preparation
+
+## Install packages
+
+Install all required packages. Set `eval = TRUE` to run this chunk on first use; once installed, set back to `eval = FALSE`.
+
+```{r inst, eval = FALSE}
+install.packages(c(
+  "dplyr",       # data manipulation
+  "here",        # reproducible file paths
+  "stringr",     # string operations
+  "quanteda",    # corpus and KWIC analysis
+  "tidytext",    # tidy text mining utilities
+  "sentimentr",  # sentiment analysis (used in later notebooks)
+  "writexl",     # export to Excel
+  "ggplot2",     # visualisation
+  "Hmisc",       # miscellaneous stats utilities
+  "countrycode", # country code conversion
+  "ggimage",     # image-based ggplot2 extensions
+  "devtools"     # install from GitHub
+))
+devtools::install_github("rensa/ggflags")  # flag emoji geoms for ggplot2
+```
+
+## Activate packages
+
+```{r activate, message = FALSE, warning = FALSE}
+library(dplyr)
+library(here)
+library(stringr)
+library(tidytext)
+library(quanteda)
+library(sentimentr)
+library(writexl)
+library(ggplot2)
+library(Hmisc)
+library(countrycode)
+library(ggflags)
+```
+
+---
+
+# Processing
+
+## Load data
+
+Read the three regional CSV files and tag each with a country code, then combine into a single data frame.
+
+```{r load}
+# Define the path to the processed data directory
+data_path <- here("TWEETSWEAR-A7056", "processed_data")
+
+# Read each regional dataset and tag with a country identifier
+au <- read.csv(file.path(data_path, "geo_AU_filtered_candidate_timelines.csv")) %>%
+  mutate(var = "au")
+
+gb <- read.csv(file.path(data_path, "geo_GB_filtered_candidate_timelines.csv")) %>%
+  mutate(var = "gb")
+
+us <- read.csv(file.path(data_path, "geo_US_filtered_candidate_timelines.csv")) %>%
+  mutate(var = "us")
+
+# Combine all three datasets into one data frame
+tw_raw <- bind_rows(au, gb, us)
+
+# Quick inspection of structure
+glimpse(tw_raw)
+str(tw_raw)
+```
+
+## Clean and pre-process text
+
+This chunk performs all text cleaning and feature engineering in a single `mutate()` call for efficiency. Steps include: removing URLs and @mentions, lowercasing, generating a words-only version for token counting, and assigning document IDs per country.
+
+```{r clean}
+twdat_raw <- tw_raw %>%
+  mutate(
+    # Remove newlines, URLs (http...), and @mentions; collapse extra whitespace
+    cleantext = text %>%
+      str_replace_all(fixed("\n"), " ") %>%
+      str_replace_all("http\\S+|@\\S+", " ") %>%
+      str_squish(),
+
+    # Lowercase version for case-insensitive matching
+    ltext = tolower(cleantext),
+
+    # Standardise country code to uppercase two-letter ISO format
+    country = case_when(
+      var == "au" ~ "AU",
+      var == "gb" ~ "GB",
+      var == "us" ~ "US",
+      TRUE        ~ var
+    ),
+
+    # Lowercase country code for flag/plot compatibility
+    code = tolower(country),
+
+    # Strip all non-word characters for clean token counting
+    wordsonly = cleantext %>%
+      str_replace_all("\\W", " ") %>%
+      str_squish(),
+
+    # Count tokens using quanteda's fast tokeniser
+    words = lengths(quanteda::tokenize_fastestword(wordsonly))
+  ) %>%
+  # Assign a sequential document ID within each country group
+  group_by(code) %>%
+  mutate(docname = paste0("text", row_number())) %>%
+  ungroup()
+
+glimpse(twdat_raw)
+```
+
+## Language filtering
+
+Twitter/X provides a `lang` field for language identification. The filter below is currently disabled (non-English tweets are retained). Uncomment the `filter` line to restrict the corpus to English-only tweets.
+
+```{r lang-filter}
+twdat <- twdat_raw
+# Uncomment to retain only English-identified tweets:
+# twdat <- twdat_raw %>% dplyr::filter(lang == "en")
+```
+
+## Compare corpus size before and after language filtering
+
+This chunk (set to `eval = FALSE` by default) reports tweet and word counts before and after potential language filtering, providing a useful sanity check.
+
+```{r lang-compare, eval = FALSE}
+tb1 <- twdat_raw %>%
+  group_by(var) %>%
+  summarise(words = sum(words), tweets = n(), status = "before removal")
+
+tb2 <- twdat %>%
+  group_by(var) %>%
+  summarise(words = sum(words), tweets = n(), status = "after removal")
+
+bind_rows(tb1, tb2)
+```
+
+## Split by country and save
+
+Partition the combined dataset into three country-specific data frames and save each as an `.rda` file for use in later processing steps.
+
+```{r split-save}
+audf <- twdat %>% filter(code == "au")
+gbdf <- twdat %>% filter(code == "gb")
+usdf <- twdat %>% filter(code == "us")
+
+saveRDS(audf, file = here("data", "audf.rda"))
+saveRDS(gbdf, file = here("data", "gbdf.rda"))
+saveRDS(usdf, file = here("data", "usdf.rda"))
+```
+
+## Save and reload combined dataset
+
+```{r save-load}
+saveRDS(twdat, file = here("data", "twdat.rda"))
+twdat <- readRDS(file = here("data", "twdat.rda"))
+str(twdat)
+head(twdat)
+```
+
+---
+
+# Regex Patterns for Vulgar Language Detection
+
+## Background
+
+The regex vocabulary below is designed to detect vulgar expressions and their common obfuscations (e.g., leetspeak substitutions, repeated characters). The list is grounded in the following sources:
+
+- *List of Bad Words*, February 2025. http://www.noswearing.com/dictionary/
+- *BannedWordList.com*, March 2013. http://www.bannedwordlist.com/
+- McEnery, A. (2006). *Swearing in English*. Routledge.
+- Thelwall, M. (2008). Fk Yea I Swear: Cursing and Gender in MySpace. *Corpora*, 3(1), 83–107.
+- Coats, S. (2021). 'Bad language' in the Nordics. *Acta Linguistica Hafniensia*, 53(1), 22–57.
+- Love, R. (2021). Swearing in informal spoken English: 1990s–2010s. *Text & Talk*, 41(5-6), 739–762.
+
+After reviewing these sources, items were selectively retained based on the authors' judgement of what constitutes vulgarity in the present study context.
+
+## Define regex patterns
+
+Each pattern uses character classes to capture common visual substitutions (e.g., `@` → `a`, `3` → `e`, `0` → `o`, `$` → `s`). Compound forms, affixes, and online abbreviations are also included.
+
+```{r patterns}
+patterns <- c(
+
+  # --- ARSEHOLE/S ---
+  # Captures "arsehole" and compounds like "jackarse", with leet variants
+  "\\b(dumb|stupid|lazy|worthless|useless|brain|dead|jack)*[a@4äáå]r[s5$§z][e3€ëéê][h]?[o0øöóõ]*[l1£][e3€ëéê]*[s5$§z]*\\b",
+
+  # --- ASS / ASSHOLE/S ---
+  # Captures "ass", "asshole", "dumbass", "jackass", etc.
+  "\\b(dumb|stupid|lazy|worthless|useless|brain|dead|jack)*[a@4äáå][s5$§z]{2,}[h]?[o0øöóõ]*[l1|£][e3€ëéê]*[s5$§z]*\\b",
+
+  # --- BITCH ---
+  # Includes inflected forms: bitches, bitching, bitched
+  "\\b[b8ß|3][i1!|ïíì]+[a@4äáå]*[t7+†][c¢©(][h](es|ez|ing|ed)*\\b",
+
+  # --- BASTARD ---
+  "\\b[b8ß|3][a@4äáå][s5$§z][t7+†][a@4äáå]r[d][o]*(s|z)*\\b",
+
+  # --- BEANER (ethnic slur) ---
+  "\\b[b8ß|3][e3€ëéê][a@4äáå]n[e3€ëéê]r(s|z)*\\b",
+
+  # --- BELLEND ---
+  "\\b[b8ß|3][e3€ëéê]ll[e3€ëéê]nd(s|z)*\\b",
+
+  # --- BIMBO ---
+  "\\b[b8ß|3][1!|ïíì]mb[o0øöóõ](s|z)*\\b",
+
+  # --- BLOODY ---
+  "\\bbl[o0øöóõ]{2,}d[iy¥](ed)*\\b",
+
+  # --- BOLLOCKS ---
+  "\\b[8ß|3][o0øöóõ]ll[o0øöóõiïíì][xc¢©(k|<{(]+[s5$§z]?\\b",
+
+  # --- BONER ---
+  "\\bboner[s]*\\b",
+
+  # --- BONK ---
+  "\\b[8ß|3][o0øöóõ]n[k|<{(](in|ing)*\\b",
+
+  # --- BOOBS ---
+  "\\b[8ß|3][o0øöóõ]{2,}[b8ß|3][ie]*[s5$§z]?\\b",
+
+  # --- BUGGER ---
+  "\\b[8ß|3][u|µüúû]gg[e3€ëéê]r(ing|s|z)*\\b",
+
+  # --- BULLSHIT ---
+  "\\b[b8ß|3][u|µüúû]ll[s5$§z]h[1!|ïíì]+[t7+†]*\\b",
+
+  # --- BUTT (and compounds: butthead, butthole, etc.) ---
+  "\\b[b8ß3][uµüúû][t7+†][t7+†][sz]*(face|head|wit|whipe|hole|h)*[hl]*[sz]*\\b",
+
+  # --- DAMN (including goddamn) ---
+  "\\b(god)*damn\\b",
+
+  # --- DARKIE (racial slur) ---
+  "\\bdarki(es)*\\b",
+
+  # --- DYKE / DIKE ---
+  "\\b(bull)*d[iy]*ke(s|z)*\\b",
+
+  # --- DILDO ---
+  "\\bdildo(s|z)*\\b",
+
+  # --- DORK ---
+  "\\bdork(s|z)*\\b",
+
+  # --- EFF (euphemism for "fuck") ---
+  "\\beff(ing|in|ed|d)*\\b",
+
+  # --- FANNY ---
+  "\\bfann(y|ies)+\\b",
+
+  # --- FART ---
+  "\\bfart(s|z|ing|in|ed)*\\b",
+
+  # --- FRIG ---
+  "\\bfrig(g|gin|ging|ged|gs)*\\b",
+
+  # --- FUCK (and compounds: motherfuck, cockfuck, etc.; leet variants) ---
+  "\\b(cluster|head|mother|motha|mutha|mada|cock|mom|mum|daddy|father|sister|brother)*[f=ƒ][uµüúû|@a4äáå|e3€ëéê|o0øöóõ|*]*[c¢©(]*[k|<{(][e3€ëéê]*[r]*(head|face|wit|ing|er|a|ed|ers|az)*\\b",
+
+  # --- FUCK (alternative leet spelling, e.g. "fck", "f**k") ---
+  "\\b[f=ƒ][c¢©(*k<{(uµüúû*]+(ing|er|a|ed|ers|az)*\\b",
+
+  # --- F (standalone "f" used as euphemism, e.g. "what the f") ---
+  "\\bf\\b",
+
+  # --- GASH ---
+  "\\bgash\\b",
+
+  # --- GOOK (racial slur) ---
+  "\\bg[o]*ok(s|z)*\\b",
+
+  # --- IDIOT ---
+  "\\bidiot(s|z)*\\b",
+
+  # --- JACKASS ---
+  "\\bjacka[s5$§z][s5$§z]\\b",
+
+  # --- JAP (ethnic slur) ---
+  "\\bjap[zs]*\\b",
+
+  # --- JERK ---
+  "\\bjerk(s|z|in|ing|ed)*\\b",
+
+  # --- JISS / JIZZ ---
+  "\\bji[s5$§z][s5$§z]+\\b",
+
+  # --- JUG ---
+  "\\bjug[g]*[s5$§z]*\\b",
+
+  # --- SHIT (and dipshit, shitting, etc.) ---
+  "\\b[(dip)]*[s5$§z]h[1!|ïíì]+[t7+†]*(ing|e|in|er|a|ed|ers|az|s|z)*\\b",
+
+  # -------------------------------------------------------
+  # ONLINE ABBREVIATIONS containing vulgar roots
+  # -------------------------------------------------------
+
+  "\\bktfo\\b",   # Knock the f*** out
+  "\\bstfu\\b",   # Shut the f*** up
+  "\\bgtfo\\b",   # Get the f*** out
+  "\\bngaf\\b",   # Not giving a f***
+  "\\bdgaf\\b",   # Don't give a f***
+  "\\bffs\\b",    # For f***'s sake
+  "\\bfml\\b",    # F*** my life
+  "\\bomfg\\b",   # Oh my f***ing god
+  "\\baf\\b",     # As f***
+  "\\btf\\b",     # The f***
+  "\\bwtf\\b",    # What the f***
+  "\\blmao\\b",   # Laughing my ass off
+  "\\blmfao\\b",  # Laughing my f***ing ass off
+  "\\brofl\\b",   # Rolling on floor laughing
+
+  # -------------------------------------------------------
+  # RACIAL / ETHNIC SLURS
+  # -------------------------------------------------------
+
+  "\\bch[i]*nk[zs]*\\b",               # CHINK
+  "\\bcoon[zs]*\\b",                    # COON
+
+  # -------------------------------------------------------
+  # FURTHER VULGAR TERMS
+  # -------------------------------------------------------
+
+  "\\b[bull]*crap(ping|ped|s|z|pin)*\\b",           # CRAP
+  "\\bcum(ming)*\\b",                                # CUM
+  "\\bc[o0øöóõ][c¢©]+[(k|<{(|x]+(suck|sak|suk)*[k]*(er|ers|a|az|as)*\\b",  # COCK
+  "\\b[kc¢©(][u|µüúû]*nt[zs]*\\b",                  # CUNT
+  "\\b[d][1!|ïíì][c¢©(][xk|<{(][(head)]*[zs]*\\b",  # DICK
+  "\\b[f|=ƒ][a@4äáåe]g[g]*[ioa]*[t]*[zs]*\\b",      # FAG (derogatory)
+  "\\bh[o0øöóõ][e3€ëéê][zs]*\\b",                   # HOE
+  "\\bh[o0øöóõ]r[e3€ëéê]*[zs]*\\b",                 # HORE (variant of WHORE)
+  "\\b[k|<{(][i1!ïíìy][k|<{(][e3€ëéê][zs]*\\b",     # KIKE (ethnic slur)
+  "\\bn[i1!ïíì]gg[e3€ëéê|@a4äáå][r]*[zs]*\\b",      # N-WORD (racial slur)
+  "\\bknob[(head)]*[zs]*\\b",                        # KNOB
+  "\\blesbo[sz]*\\b",                                # LESBO
+  "\\bming[(a|er)]+(s|z)*\\b",                       # MINGER
+  "\\bm[o|u]ron(ic|s|z)*\\b",                        # MORON
+  "\\bmuff\\b",                                      # MUFF
+  "\\bnonce\\b",                                     # NONCE
+  "\\bnympho\\w*\\b",                                # NYMPHO
+  "\\bp[e3€ëéê]ck[ae]?[rs]*\\b",                    # PECKER
+  "\\bp[e3€ëéê]do[philf]*[e]*[zs]*\\b",             # PEDO
+  "\\bpik(i|is|ey|ies|eys|eyz|iez|iz)+\\b",         # PIKEY
+  "\\bpimp(s|ing|in|z|ed)*\\b",                     # PIMP
+  "\\bp[i1!|ïíì][s5$§z][s5$§]+(in|ing|er|a|ers|erz)*\\b",  # PISS
+  "\\bpooft(er|ers|as|az)+\\b",                     # POOFTER
+  "\\bprick[zs]*\\b",                               # PRICK
+  "\\bpuk[e]*(s|z|ing|ed)*\\b",                     # PUKE
+  "\\bp[u|µüúû][s5$§z][s5$§z][@a4äáå]*[y¥][zs]*\\b",  # PUSSY
+  "\\bqu[e]+[a]*f(s|z|ing|ed)*\\b",                 # QUEEF
+  "\\bshag(ging|gin|ged)*\\b",                      # SHAG
+  "\\bskank[yzs]*\\b",                              # SKANK
+  "\\bslag[zs]*\\b",                                # SLAG
+  "\\b[s5$§z]l[uµüúû][t7+†](i|y)*[zs]*\\b",        # SLUT
+  "\\bsod[d]*[sz]*(ing)*\\b",                       # SOD
+  "\\bspast(ic|ics|icz)*\\b",                       # SPASTIC
+  "\\bretard[zs]*\\b",                              # RETARD
+  "\\btit[t]*(i|ies|ay|ays|ayz)*\\b",               # TITS
+  "\\btosser[sz]*\\b",                              # TOSSER
+  "\\btr[a@4äáå]nn(y|ies|iez)+\\b",                 # TRANNY
+  "\\bturd[sz]*\\b",                                # TURD
+  "\\b[t7+†]w[a@4äáå][t7+†][zs]*\\b",              # TWAT
+  "\\bw[a@4äáå]n[k|<{(](z|er|ers|ing|az|a|ed)*\\b", # WANK
+  "\\b(cam|man|m)*wh[o0øöóõ]?r[e3€ëéê]*(d|s|z|ing)*\\b"  # WHORE
+)
+```
+
+---
+
+# KWIC (Keywords in Context) Extraction
+
+The KWIC procedure uses `quanteda::kwic()` to locate each pattern in context, returning the matched keyword along with surrounding left and right context windows. Results are extracted for each country separately and saved to disk.
+
+## Helper function for KWIC extraction
+
+Wrapping the repeated KWIC logic in a function avoids code duplication and makes each country's extraction easier to read and maintain.
+
+```{r kwic-function}
+run_kwic <- function(df, country_code, patterns, output_dir) {
+  message("Running KWIC for: ", toupper(country_code))
+  t0 <- Sys.time()
+
+  # Tokenise pre-split text (splitting on spaces) and run KWIC
+  kwic_out <- quanteda::kwic(
+    quanteda::tokens(stringi::stri_split_fixed(df$ltext, " ")),
+    pattern    = patterns,
+    valuetype  = "regex"
+  ) %>%
+    as.data.frame() %>%
+    dplyr::select(-from, -to) %>%  # drop token position indices (not needed downstream)
+    dplyr::mutate(code = country_code)
+
+  # Save to disk
+  saveRDS(kwic_out, file = file.path(output_dir, paste0("kwic_", country_code, "df_raw.rda")))
+
+  t1 <- Sys.time()
+  message("  Done in ", round(difftime(t1, t0, units = "secs"), 1), "s — ",
+          nrow(kwic_out), " matches found.")
+
+  kwic_out
+}
+```
+
+## Run KWIC for each country
+
+```{r kwic-run}
+tables_dir <- here("tables")
+
+aukwic <- run_kwic(audf, "au", patterns, tables_dir)
+gbkwic <- run_kwic(gbdf, "gb", patterns, tables_dir)
+uskwic <- run_kwic(usdf, "us", patterns, tables_dir)
+
+# Combine all three into one data frame
+kwic_results <- bind_rows(aukwic, gbkwic, uskwic)
+str(kwic_results)
+```
+
+---
+
+# Annotate KWIC Results
+
+Map each regex pattern back to a human-readable lemma label. Using a named lookup vector and `dplyr::recode()` is more concise and maintainable than a long `case_when()` chain.
+
+```{r annotate}
+# Named lookup: regex pattern -> lemma label
+pattern_to_lemma <- c(
+  "\\b(dumb|stupid|lazy|worthless|useless|brain|dead|jack)*[a@4äáå]r[s5$§z][e3€ëéê][h]?[o0øöóõ]*[l1£][e3€ëéê]*[s5$§z]*\\b" = "arsehole/s",
+  "\\b(dumb|stupid|lazy|worthless|useless|brain|dead|jack)*[a@4äáå][s5$§z]{2,}[h]?[o0øöóõ]*[l1|£][e3€ëéê]*[s5$§z]*\\b" = "ass/asshole/s",
+  "\\b[b8ß|3][i1!|ïíì]+[a@4äáå]*[t7+†][c¢©(][h](es|ez|ing|ed)*\\b" = "bitch",
+  "\\b[b8ß|3][a@4äáå][s5$§z][t7+†][a@4äáå]r[d][o]*(s|z)*\\b" = "bastard",
+  "\\b[b8ß|3][e3€ëéê][a@4äáå]n[e3€ëéê]r(s|z)*\\b" = "beaner",
+  "\\b[b8ß|3][e3€ëéê]ll[e3€ëéê]nd(s|z)*\\b" = "bellend",
+  "\\b[b8ß|3][1!|ïíì]mb[o0øöóõ](s|z)*\\b" = "bimbo",
+  "\\bbl[o0øöóõ]{2,}d[iy¥](ed)*\\b" = "bloody",
+  "\\b[8ß|3][o0øöóõ]ll[o0øöóõiïíì][xc¢©(k|<{(]+[s5$§z]?\\b" = "bollocks",
+  "\\bboner[s]*\\b" = "boner",
+  "\\b[8ß|3][o0øöóõ]n[k|<{(](in|ing)*\\b" = "bonk",
+  "\\b[8ß|3][o0øöóõ]{2,}[b8ß|3][ie]*[s5$§z]?\\b" = "boobs",
+  "\\b[8ß|3][u|µüúû]gg[e3€ëéê]r(ing|s|z)*\\b" = "bugger",
+  "\\b[b8ß|3][u|µüúû]ll[s5$§z]h[1!|ïíì]+[t7+†]*\\b" = "bullshit",
+  "\\b[b8ß3][uµüúû][t7+†][t7+†][sz]*(face|head|wit|whipe|hole|h)*[hl]*[sz]*\\b" = "butt",
+  "\\b(god)*damn\\b" = "damn",
+  "\\bdarki(es)*\\b" = "darkie",
+  "\\b(bull)*d[iy]*ke(s|z)*\\b" = "dike",
+  "\\bdildo(s|z)*\\b" = "dildo",
+  "\\bdork(s|z)*\\b" = "dork",
+  "\\beff(ing|in|ed|d)*\\b" = "eff",
+  "\\bfann(y|ies)+\\b" = "fanny",
+  "\\bfart(s|z|ing|in|ed)*\\b" = "fart",
+  "\\bfrig(g|gin|ging|ged|gs)*\\b" = "frig",
+  "\\b(cluster|head|mother|motha|mutha|mada|cock|mom|mum|daddy|father|sister|brother)*[f=ƒ][uµüúû|@a4äáå|e3€ëéê|o0øöóõ|*]*[c¢©(]*[k|<{(][e3€ëéê]*[r]*(head|face|wit|ing|er|a|ed|ers|az)*\\b" = "fuck",
+  "\\b[f=ƒ][c¢©(*k<{(uµüúû*]+(ing|er|a|ed|ers|az)*\\b" = "fuck",
+  "\\bf\\b" = "fuck",
+  "\\bgash\\b" = "gash",
+  "\\bg[o]*ok(s|z)*\\b" = "gook",
+  "\\bidiot(s|z)*\\b" = "idiot",
+  "\\bjacka[s5$§z][s5$§z]\\b" = "jackass",
+  "\\bjap[zs]*\\b" = "jap",
+  "\\bjerk(s|z|in|ing|ed)*\\b" = "jerk",
+  "\\bji[s5$§z][s5$§z]+\\b" = "jiss",
+  "\\bjug[g]*[s5$§z]*\\b" = "jug",
+  "\\b[(dip)]*[s5$§z]h[1!|ïíì]+[t7+†]*(ing|e|in|er|a|ed|ers|az|s|z)*\\b" = "shit",
+  "\\bktfo\\b" = "online",
+  "\\bstfu\\b" = "online",
+  "\\bgtfo\\b" = "online",
+  "\\bngaf\\b" = "online",
+  "\\bdgaf\\b" = "online",
+  "\\bffs\\b" = "online",
+  "\\bfml\\b" = "online",
+  "\\bomfg\\b" = "online",
+  "\\baf\\b" = "online",
+  "\\btf\\b" = "online",
+  "\\bwtf\\b" = "online",
+  "\\blmao\\b" = "online",
+  "\\blmfao\\b" = "online",
+  "\\brofl\\b" = "online",
+  "\\bch[i]*nk[zs]*\\b" = "chink",
+  "\\bcoon[zs]*\\b" = "coon",
+  "\\b[bull]*crap(ping|ped|s|z|pin)*\\b" = "crap",
+  "\\bcum(ming)*\\b" = "cum",
+  "\\bc[o0øöóõ][c¢©]+[(k|<{(|x]+(suck|sak|suk)*[k]*(er|ers|a|az|as)*\\b" = "cock",
+  "\\b[kc¢©(][u|µüúû]*nt[zs]*\\b" = "cunt",
+  "\\b[d][1!|ïíì][c¢©(][xk|<{(][(head)]*[zs]*\\b" = "dick",
+  "\\b[f|=ƒ][a@4äáåe]g[g]*[ioa]*[t]*[zs]*\\b" = "fag",
+  "\\bh[o0øöóõ][e3€ëéê][zs]*\\b" = "hoe",
+  "\\bh[o0øöóõ]r[e3€ëéê]*[zs]*\\b" = "whore",
+  "\\b[k|<{(][i1!ïíìy][k|<{(][e3€ëéê][zs]*\\b" = "kike",
+  "\\bn[i1!ïíì]gg[e3€ëéê|@a4äáå][r]*[zs]*\\b" = "nigger",
+  "\\bknob[(head)]*[zs]*\\b" = "knob",
+  "\\blesbo[sz]*\\b" = "lesbo",
+  "\\bming[(a|er)]+(s|z)*\\b" = "minger",
+  "\\bm[o|u]ron(ic|s|z)*\\b" = "moron",
+  "\\bmuff\\b" = "muff",
+  "\\bnonce\\b" = "nonce",
+  "\\bnympho\\w*\\b" = "nympho",
+  "\\bp[e3€ëéê]ck[ae]?[rs]*\\b" = "pecker",
+  "\\bp[e3€ëéê]do[philf]*[e]*[zs]*\\b" = "pedo",
+  "\\bpik(i|is|ey|ies|eys|eyz|iez|iz)+\\b" = "pikey",
+  "\\bpimp(s|ing|in|z|ed)*\\b" = "pimp",
+  "\\bp[i1!|ïíì][s5$§z][s5$§]+(in|ing|er|a|ers|erz)*\\b" = "piss",
+  "\\bpooft(er|ers|as|az)+\\b" = "poofter",
+  "\\bprick[zs]*\\b" = "prick",
+  "\\bpuk[e]*(s|z|ing|ed)*\\b" = "puke",
+  "\\bp[u|µüúû][s5$§z][s5$§z][@a4äáå]*[y¥][zs]*\\b" = "pussy",
+  "\\bqu[e]+[a]*f(s|z|ing|ed)*\\b" = "queef",
+  "\\bshag(ging|gin|ged)*\\b" = "shag",
+  "\\bskank[yzs]*\\b" = "skank",
+  "\\bslag[zs]*\\b" = "slag",
+  "\\b[s5$§z]l[uµüúû][t7+†](i|y)*[zs]*\\b" = "slut",
+  "\\bsod[d]*[sz]*(ing)*\\b" = "sod",
+  "\\bspast(ic|ics|icz)*\\b" = "spastic",
+  "\\bretard[zs]*\\b" = "retard",
+  "\\btit[t]*(i|ies|ay|ays|ayz)*\\b" = "tits",
+  "\\btosser[sz]*\\b" = "tosser",
+  "\\btr[a@4äáå]nn(y|ies|iez)+\\b" = "tranny",
+  "\\bturd[sz]*\\b" = "turd",
+  "\\b[t7+†]w[a@4äáå][t7+†][zs]*\\b" = "twat",
+  "\\bw[a@4äáå]n[k|<{(](z|er|ers|ing|az|a|ed)*\\b" = "wank",
+  "\\b(cam|man|m)*wh[o0øöóõ]?r[e3€ëéê]*(d|s|z|ing)*\\b" = "whore"
+)
+
+# Apply lookup; fall back to the raw pattern string if no match is found
+kwicdf_annotated <- kwic_results %>%
+  mutate(lemma = {
+    matched <- pattern_to_lemma[pattern]
+    ifelse(is.na(matched), pattern, matched)
+  })
+
+# Inspect the set of lemma labels assigned
+names(table(kwicdf_annotated$lemma))
+```
+
+---
+
+# Clean KWIC Results
+
+Several keyword matches require manual post-hoc filtering to remove false positives — cases where the regex matched a string that is not actually vulgar in context (e.g., "knee jerk", "kung-fu", temperature units like "°F"). Each filter step is documented with the rationale for exclusion.
+
+```{r clean-kwic}
+# ── Step 1: Preserve original keyword; strip leading/trailing punctuation ──────
+kwicdf_annotated <- kwicdf_annotated %>%
+  mutate(
+    keyword_original = keyword,
+    keyword = keyword %>%
+      str_remove("^\\W*") %>%          # remove leading non-word characters
+      str_remove("(?<!f)\\W*$")        # remove trailing non-word chars (preserve trailing "f")
+  )
+
+# ── Step 2: Remove clearly non-vulgar false positives ─────────────────────────
+
+# Hard-coded list of known false-positive keywords (abbreviations, codes, etc.)
+bad_keywords <- c(
+  "1.fc", "10:30pm(f.t", "15.8003", "19/f", "3008", "4-tit", "70'f", "8008.6",
+  "a-b-c-d-e-f", "b..e..a..u..t..i.f..u..l", "b.f.b.t.g", "b/f", "c.m.f.",
+  "cadar/f.", "f(ruitjuice", "f(x", "f)", "f)inance", "j.f.k", "key={gg",
+  "kung-fu", "kung-fu/martial", "l-i-f-e", "l.i.f.e", "m-f,", "m-f.", "m-f/",
+  "m/f", "m/f.", "m+f", "mettraux/f.", "n-f-t", "r.e.f.", "shí", "shí'kis",
+  "shì-sheanamhair", "u-f-ooooo", "u.f.o's", "v.i.f", "v.i.f!",
+  "w.e.f.", "w.e.f.?🣯‍♂️", "wold]f", "x100-f", "y.f.n.r.n", "ym=f", "λf=c",
+  "️‍🔯f", "少しビックリしてます。f(",
+  "手数料がすごいのに皆さんちょっとおかしい行動とってますよね。f"
+)
+
+kwicdf_clean <- kwicdf_annotated %>%
+
+  # Remove hard-coded false positives
+  filter(!keyword %in% bad_keywords) %>%
+
+  # Remove pattern-based false positives (regex-matched non-vulgar strings)
+  filter(!str_detect(keyword, "fak(r|er|ing|ers|ed|e)+")) %>%   # "faker", "faking" etc.
+  filter(!str_detect(keyword, "fk(r|er|ing|ers|ed|e)+")) %>%
+  filter(!str_detect(keyword, "\\w\\+f$")) %>%
+  filter(!str_detect(keyword, "n\\|f")) %>%
+  filter(!str_detect(keyword, "^\\+f$")) %>%
+  filter(!str_detect(keyword, "=(x|a|r|v|c|k|f)")) %>%          # algebraic expressions
+  filter(!str_detect(keyword, "(x|a|r|v|c|k|f)=")) %>%
+  filter(!str_detect(keyword, "feg(i|o)")) %>%
+  filter(!str_detect(keyword, "^feek.*")) %>%
+  filter(!str_detect(keyword, "(x|a|r|v|c|k|f)\\+")) %>%
+  filter(!str_detect(keyword, "\\+(x|a|r|v|c|k|f)")) %>%
+  filter(!str_detect(keyword, "^\\$")) %>%                       # price strings
+  filter(!str_detect(keyword, "\\d{3}")) %>%                     # 3+ digit numbers
+  filter(!str_detect(keyword, "\\d{2}=")) %>%
+  filter(!str_detect(keyword, "fag(a|o)+")) %>%                  # non-English words
+  filter(!str_detect(keyword, "fauk\\w*")) %>%
+  filter(!str_detect(keyword, "hoess")) %>%
+  filter(!str_detect(keyword, "z=u")) %>%
+  filter(!str_detect(keyword, "\\+jug")) %>%
+  filter(!str_detect(keyword, "2=u")) %>%
+  filter(!str_detect(keyword, "b=ok")) %>%
+  filter(!str_detect(keyword, "st=ok")) %>%
+  filter(!str_detect(keyword, "stat=u")) %>%
+  filter(!str_detect(keyword, "t=0k")) %>%
+  filter(!str_detect(keyword, "^feak\\*")) %>%
+  filter(!str_detect(keyword, "^fc+$")) %>%
+  filter(!str_detect(keyword, "^f[c]+a.*$")) %>%
+  filter(!str_detect(keyword, "^fauc.*$")) %>%
+  filter(!str_detect(keyword, "^f\\$\\d+$")) %>%
+  filter(!str_detect(keyword, "°f")) %>%                         # temperature (e.g. "75°F")
+  filter(!str_detect(keyword, "f-\\d")) %>%                      # aircraft codes (f-14, f-22)
+
+  # ── Contextual filters (lemma-specific) ──────────────────────────────────────
+
+  # HOE: only retain if preceded by a clear referring expression
+  filter(!(lemma == "hoe" & !str_detect(pre, "(such a( \\w+)?|other|is a|that( \\w+)?)\\b$"))) %>%
+
+  # JERK: exclude "knee jerk" and "chest jerk" (non-vulgar idiomatic uses)
+  filter(!(lemma == "jerk" & str_detect(pre, "(knee|chest)$"))) %>%
+
+  # EFF: only retain if post-context starts with "you/it/off/up" (vulgar uses)
+  filter(!(lemma == "eff" & !str_detect(post, "^(you|it|off|up)"))) %>%
+
+  # F (standalone): only retain before pronouns/demonstratives; exclude "flying f"
+  filter(!(keyword == "f" & !str_detect(post, "^(king|me|you|it|this|that|these|those|him|her|us|them)\\b") |
+             str_detect(pre, "(flying)\\b$"))) %>%
+
+  # CRAP: exclude "metal crap", "poker crap", "roulette crap" (gaming contexts)
+  filter(!(lemma == "crap" & str_detect(pre, "(metal|poker|roulette)\\b$"))) %>%
+
+  # DYKE: only retain after clearly vulgar/identity-marker contexts
+  filter(!(lemma == "dyke" & !str_detect(pre, "\\b(a|like|butch|bull|all|fags|as|fucking|club)\\b$"))) %>%
+
+  # FAGGOT: exclude "faggot bearer" (archaic non-vulgar use)
+  filter(!(keyword == "faggot" & str_detect(post, "(bearer)\\b$"))) %>%
+
+  # FAGS: exclude uses preceded by food/quantity words or followed by "to"
+  filter(!(keyword == "fags" & str_detect(pre, "\\b(of|and|buy|the|few|candy)\\b$") |
+             str_detect(post, "^(to)\\b"))) %>%
+
+  # FK: exclude "Bryne FK" (Norwegian football club abbreviation)
+  filter(!(keyword == "fk" & str_detect(pre, "(bryne)\\b$"))) %>%
+
+  # JIZZ: exclude "dns jizz" (networking false positive)
+  filter(!(keyword == "jizz" & str_detect(pre, "\\b(dns)\\b$"))) %>%
+
+  # FU: exclude "kung fu" / "kongfu" (martial arts)
+  filter(!(keyword == "fu" & str_detect(pre, "(k(ou)ng)\\b$"))) %>%
+
+  # KNOB: only retain "knobhead/s" (other uses too ambiguous)
+  filter(!(lemma == "knob" & !str_detect(post, "^\\b(head[s]?)\\b"))) %>%
+
+  # PECKER: exclude uses after "a/wood/of/so" (e.g. "woodpecker")
+  filter(!(keyword == "pecker" & str_detect(pre, "\\b(a|wood|of|so)\\b$"))) %>%
+
+  # SOD: only retain after indefinite article context
+  filter(!(lemma == "sod" & !str_detect(pre, "\\ba[n]{0,1}( \\w+)?( \\w+)?$"))) %>%
+
+  # SODD: exclude plural "sodds" preceded by "and"
+  filter(!(keyword == "sodd" & str_detect(post, "^\\b(s)\\b"))) %>%
+  filter(!(keyword == "sods" & str_detect(pre, "\\band\\b$"))) %>%
+
+  # TF (the f***): only retain after "how" (e.g. "how tf")
+  filter(!(lemma == "tf" & !str_detect(pre, "\\b(how)\\b$"))) %>%
+
+  # WANKA: only retain in clear referring-expression context
+  filter(!(keyword == "wanka" & !str_detect(pre, "(such a( \\w+)?|other|is a|that( \\w+)?)\\b$"))) %>%
+
+  # WHOR: exclude "casteism whor" (non-English false positive)
+  filter(!(keyword == "whor" & str_detect(pre, "\\b(casteism)\\b$"))) %>%
+
+  # JIZZ: exclude unless followed by "music" (jizz = type of bird music in some dialects)
+  filter(!(lemma == "jizz" & !str_detect(post, "^music")))
+```
+
+## Final keyword cleaning
+
+Strip residual punctuation and numeric artefacts from keyword strings introduced by regex boundary matching.
+
+```{r final-clean}
+kwicdf_clean <- kwicdf_clean %>%
+  mutate(
+    # Remove all non-alphanumeric characters except trailing "f" (preserve intentional "f")
+    keyword = gsub("(?<!f)[^A-Za-z0-9_]", "", keyword, perl = TRUE),
+    # Remove digit-dot-f patterns (e.g. "3.f")
+    keyword = str_remove_all(keyword, "\\d.f"),
+    # Remove lone digit-punctuation sequences
+    keyword = str_remove_all(keyword, "\\b\\d\\W{0,1}\\b")
+  )
+
+# Inspect final keyword set
+names(table(kwicdf_clean$keyword))
+```
+
+## Remove duplicate rows and the redundant pattern column
+
+```{r dedup}
+nrow(kwicdf_clean)
+kwicdf_clean <- kwicdf_clean %>%
+  select(-pattern) %>%   # pattern column no longer needed (lemma now carries this info)
+  distinct()             # drop exact duplicate rows
+nrow(kwicdf_clean)
+```
+
+## Spot-check: inspect a specific keyword
+
+```{r spot-check}
+# Example: inspect all retained "jizz" matches
+kwicdf_clean[kwicdf_clean$keyword == "jizz", ]
+```
+
+---
+
+# Save Final KWIC Data
+
+```{r save-final}
+saveRDS(kwicdf_clean, file = here("tables", "kwicdf_clean.rda"))
+message("Saved kwicdf_clean with ", nrow(kwicdf_clean), " rows.")
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

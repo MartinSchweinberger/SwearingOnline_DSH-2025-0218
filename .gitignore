@@ -1,0 +1,25 @@
+# R session files
+.Rhistory
+.RData
+.Ruserdata
+
+# RStudio
+.Rproj.user/
+
+# Large data
+TWEETSWEAR-A7056/
+data/
+tables/
+*.csv
+*.rds
+*.rda
+*.xlsx
+
+# Output / generated files
+*.pdf
+*.png
+*.html
+*.docx
+
+# OS files
+.DS_Store
