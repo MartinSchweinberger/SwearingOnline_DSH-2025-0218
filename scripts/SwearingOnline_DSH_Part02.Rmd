@@ -23,7 +23,7 @@ This notebook documents the second stage of the analysis of swear words in the A
 
 Set `eval = TRUE` on first use; revert to `eval = FALSE` once packages are installed.
 
-```{r inst, eval = FALSE}
+```{r installation, eval = FALSE}
 install.packages(c(
   "dplyr",       # data manipulation
   "here",        # reproducible file paths
@@ -45,7 +45,7 @@ devtools::install_github("rensa/ggflags")  # flag emoji geoms for ggplot2
 
 ## Activate packages
 
-```{r activate, message = FALSE, warning = FALSE}
+```{r activ, message = FALSE, warning = FALSE}
 library(dplyr)
 library(here)
 library(stringr)
@@ -67,7 +67,7 @@ library(forcats)
 
 Load the full tweet dataset (for word counts) and the cleaned KWIC results (for swear word instances) produced in Part 1.
 
-```{r load}
+```{r loaddat}
 twdat  <- readRDS(file = here("data", "twdat.rda"))
 kwicdf <- readRDS(file = here("tables", "kwicdf_clean.rda"))
 
@@ -482,7 +482,7 @@ tidytext::tidy(ddlda, matrix = "beta") |>
 
 Uses a theory-informed seed dictionary to guide topic assignment. Topics broadly reflect domains found in prior Twitter research (politics, sport, entertainment, etc.). The `residual = TRUE` argument adds a catch-all residual topic for tweets that do not fit any seed category well.
 
-```{r seeded-lda, eval = T}
+```{r seeded-lda, eval = F}
 dict <- dictionary(list(
   crime         = c("crime", "murder", "polic", "violenc", "theft", "assault", "shoot", "arrest", "prison", "gun"),
   employment    = c("job", "employ", "work", "hire", "wage", "career", "unemploy", "salari", "intern", "boss"),
@@ -542,6 +542,8 @@ head(topic_df)
 
 ```{r load-topics}
 topic_df <- readRDS(file = here("tables", "topic_df.rda"))
+# inspect
+head(topic_df)
 ```
 
 ## Join topic labels to tweet data

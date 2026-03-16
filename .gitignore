@@ -16,9 +16,6 @@ tables/
 *.xlsx
 
 # Output / generated files
-*.pdf
-*.png
-*.html
 *.docx
 
 # OS files
